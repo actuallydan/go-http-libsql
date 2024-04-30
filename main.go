@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
 )
@@ -20,7 +21,9 @@ type Post struct {
 }
 
 var (
-	db *sql.DB
+	db       *sql.DB
+	upgrader = websocket.Upgrader{}
+	conn     *websocket.Conn
 )
 
 func main() {
@@ -46,10 +49,34 @@ func main() {
 	http.HandleFunc("/posts", postsHandler)
 	http.HandleFunc("/posts/", postHandler)
 	http.HandleFunc("/*", handleHtml)
+	http.HandleFunc("/socket", socketHandler)
 
 	fmt.Println("Server is running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 	defer db.Close()
+}
+func socketHandler(w http.ResponseWriter, r *http.Request) {
+	var err error
+	conn, err = upgrader.Upgrade(w, r, nil)
+
+	if err != nil {
+		log.Print("upgrade failed: ", err)
+		return
+	}
+
+	defer conn.Close()
+
+	for {
+		mt, message, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("read failed: ", err)
+			break
+		}
+
+		fmt.Println(mt, string(message))
+
+		conn.WriteMessage(mt, []byte("My message from the server, clown"))
+	}
 }
 
 func postsHandler(w http.ResponseWriter, r *http.Request) {
@@ -92,8 +119,16 @@ func handleHtml(w http.ResponseWriter, r *http.Request) {
 
 	str := fmt.Sprintf(`
 	<html>
-
+	<head>
+	<style>
+	* {
+		font-family: monospace;
+	}
+	</style>
+	</head>
 	<body>
+	<button id="pingSocket" onclick="pingSocket">Socket Ping</button>
+
 	<button id="createPost">Create Post</button>
 	<ul id="posts">
 		%s
@@ -101,7 +136,38 @@ func handleHtml(w http.ResponseWriter, r *http.Request) {
 	<script>
 		let items = document.getElementById("posts");
 
+		var socket = new WebSocket("ws://localhost:8080/socket");
 
+		socket.onopen = function () {
+		  console.log("Status: Connected");
+		};
+	
+		socket.onmessage = function (e) {
+		  console.log("Server: " + e.data);
+
+		  try {
+			const response = JSON.parse(e.data)
+
+			handleWsResponses(response)
+
+		  } catch (err) {
+			console.error("not json", err)
+		  }
+		};
+
+		function handleWsResponses(message){
+			if(message.messageType === "new"){
+				items.innerHTML += '<li>' + JSON.stringify(message.post) + '</li>'
+			}
+		}
+		function pingSocket() {
+			console.log("is socket ready?", socket)
+			if(!socket){
+				console.log("not connected to socket server")
+				return
+			}
+			socket.send("ping")	
+		}
 
 		function createPostHandler(){
 			fetch("/posts", {
@@ -117,6 +183,8 @@ func handleHtml(w http.ResponseWriter, r *http.Request) {
 		}
 		
 		document.getElementById("createPost").addEventListener("click", createPostHandler);
+		document.getElementById("pingSocket").addEventListener("click", pingSocket);
+
 	</script>
 	</body>
 	</html>
@@ -163,8 +231,15 @@ func getPosts(w http.ResponseWriter) []Post {
 	return ps
 }
 
+type WSPush struct {
+	MessageType string `json:"messageType"`
+	Post        Post   `json:"post"`
+}
+
 func handlePostPosts(w http.ResponseWriter, r *http.Request) {
 	var p Post
+	var res WSPush
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Error reading request body", http.StatusBadRequest)
@@ -185,6 +260,11 @@ func handlePostPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.ID = int(lastID)
+
+	res.MessageType = "new"
+	res.Post = p
+
+	conn.WriteJSON(res)
 
 	w.Header().Set("Content-Type", "application/json")
 	// w.WriteHeader(http.StatusCreated)
